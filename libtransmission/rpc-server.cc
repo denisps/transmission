@@ -1036,23 +1036,6 @@ void handle_request(struct evhttp_request* req, void* arg)
     {
         handle_web_client(req, server);
     }
-    else if (tr_strv_starts_with(uri, torrents_base_path))
-    {
-        if (!server->settings_.is_torrent_serving_enabled)
-        {
-            send_simple_response(req, HTTP_NOTFOUND, "Torrent content serving is disabled");
-        }
-        else if (!isHostnameAllowed(server, req))
-        {
-            send_simple_response(req, 421, "Host not whitelisted");
-        }
-        else
-        {
-            auto subpath = std::string_view{ uri };
-            subpath = subpath.substr(std::size(torrents_base_path));
-            handle_torrent_content(req, server, subpath);
-        }
-    }
     else if (!isHostnameAllowed(server, req))
     {
         static auto constexpr Body =
@@ -1069,6 +1052,12 @@ void handle_request(struct evhttp_request* req, void* arg)
         tr_logAddWarn(
             fmt::format(fmt::runtime(_("Rejected request from {host} (Host not whitelisted)")), fmt::arg("host", remote_host)));
         send_simple_response(req, 421, Body);
+    }
+    else if (server->settings_.is_torrent_serving_enabled && tr_strv_starts_with(uri, torrents_base_path))
+    {
+        auto subpath = std::string_view{ uri };
+        subpath = subpath.substr(std::size(torrents_base_path));
+        handle_torrent_content(req, server, subpath);
     }
     else if (uri != rpc_base_path)
     {
