@@ -510,6 +510,7 @@ auto constexpr MyStatic = std::array<std::u8string_view, TR_N_KEYS>{
     u8"rpc_password"sv, // daemon, rpc server settings
     u8"rpc_port"sv, // daemon, gtk app, rpc server settings
     u8"rpc_socket_mode"sv, // rpc server settings
+    u8"rpc_torrent_serving_enabled"sv, // rpc server settings
     u8"rpc_url"sv, // rpc server settings
     u8"rpc_username"sv, // daemon, rpc server settings
     u8"rpc_version"sv, // rpc

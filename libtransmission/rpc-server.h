@@ -62,6 +62,7 @@ public:
         bool is_anti_brute_force_enabled = false;
         bool is_enabled = false;
         bool is_host_whitelist_enabled = true;
+        bool is_torrent_serving_enabled = false;
         bool is_whitelist_enabled = true;
         size_t anti_brute_force_limit = 100U;
         std::string bind_address_str = "0.0.0.0";
@@ -88,6 +89,7 @@ public:
             Field<&Settings::port>{ TR_KEY_rpc_port },
             Field<&Settings::salted_password>{ TR_KEY_rpc_password },
             Field<&Settings::socket_mode>{ TR_KEY_rpc_socket_mode },
+            Field<&Settings::is_torrent_serving_enabled>{ TR_KEY_rpc_torrent_serving_enabled },
             Field<&Settings::url>{ TR_KEY_rpc_url },
             Field<&Settings::username>{ TR_KEY_rpc_username },
             Field<&Settings::whitelist_str>{ TR_KEY_rpc_whitelist },

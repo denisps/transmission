@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstring> /* for strcspn() */
@@ -37,6 +38,7 @@
 #include "libtransmission/crypto-utils.h" /* tr_ssha1_matches() */
 #include "libtransmission/error.h"
 #include "libtransmission/file-utils.h"
+#include "libtransmission/inout.h"
 #include "libtransmission/log.h"
 #include "libtransmission/net.h"
 #include "libtransmission/platform.h" /* tr_getWebClientDir() */
@@ -46,6 +48,8 @@
 #include "libtransmission/session.h"
 #include "libtransmission/string-utils.h"
 #include "libtransmission/timer.h"
+#include "libtransmission/torrent.h"
+#include "libtransmission/torrents.h"
 #include "libtransmission/tr-strbuf.h"
 #include "libtransmission/types.h"
 #include "libtransmission/variant.h"
@@ -362,6 +366,436 @@ void handle_web_client(struct evhttp_request* req, tr_rpc_server const* server)
     }
 }
 
+// ---
+
+[[nodiscard]] constexpr char const* mimetype_guess_extended(std::string_view path)
+{
+    // Extended MIME types for serving torrent content (media, web pages, etc.)
+    auto constexpr Types = std::array<std::pair<std::string_view, char const*>, 30>{ {
+        { ".aac"sv, "audio/aac" },
+        { ".avi"sv, "video/x-msvideo" },
+        { ".css"sv, "text/css" },
+        { ".flac"sv, "audio/flac" },
+        { ".gif"sv, "image/gif" },
+        { ".htm"sv, "text/html" },
+        { ".html"sv, "text/html" },
+        { ".ico"sv, "image/vnd.microsoft.icon" },
+        { ".jpeg"sv, "image/jpeg" },
+        { ".jpg"sv, "image/jpeg" },
+        { ".js"sv, "application/javascript" },
+        { ".json"sv, "application/json" },
+        { ".m4a"sv, "audio/mp4" },
+        { ".m4v"sv, "video/mp4" },
+        { ".mkv"sv, "video/x-matroska" },
+        { ".mov"sv, "video/quicktime" },
+        { ".mp3"sv, "audio/mpeg" },
+        { ".mp4"sv, "video/mp4" },
+        { ".mpeg"sv, "video/mpeg" },
+        { ".ogg"sv, "audio/ogg" },
+        { ".ogv"sv, "video/ogg" },
+        { ".opus"sv, "audio/opus" },
+        { ".png"sv, "image/png" },
+        { ".svg"sv, "image/svg+xml" },
+        { ".ts"sv, "video/mp2t" },
+        { ".txt"sv, "text/plain" },
+        { ".wav"sv, "audio/wav" },
+        { ".weba"sv, "audio/webm" },
+        { ".webm"sv, "video/webm" },
+        { ".webp"sv, "image/webp" },
+    } };
+
+    for (auto const& [suffix, mime_type] : Types)
+    {
+        if (tr_strv_ends_with(path, suffix))
+        {
+            return mime_type;
+        }
+    }
+
+    return "application/octet-stream";
+}
+
+// Parse an HTTP Range header value like "bytes=START-END" into byte offsets.
+// Returns true on success, populating range_begin and range_end (inclusive).
+bool parse_range_header(char const* range_str, uint64_t file_size, uint64_t& range_begin, uint64_t& range_end)
+{
+    if (range_str == nullptr)
+    {
+        return false;
+    }
+
+    auto range = std::string_view{ range_str };
+    static auto constexpr Prefix = "bytes="sv;
+    if (!tr_strv_starts_with(range, Prefix))
+    {
+        return false;
+    }
+    range.remove_prefix(std::size(Prefix));
+
+    auto const dash = range.find('-');
+    if (dash == std::string_view::npos)
+    {
+        return false;
+    }
+
+    auto const start_str = range.substr(0, dash);
+    auto const end_str = range.substr(dash + 1);
+
+    if (std::empty(start_str))
+    {
+        // suffix range like "bytes=-500" (last 500 bytes)
+        auto suffix_len = uint64_t{};
+        auto const [ptr, ec] = std::from_chars(std::data(end_str), std::data(end_str) + std::size(end_str), suffix_len);
+        if (ec != std::errc{} || suffix_len == 0 || suffix_len > file_size)
+        {
+            return false;
+        }
+        range_begin = file_size - suffix_len;
+        range_end = file_size - 1;
+    }
+    else
+    {
+        auto const [ptr1, ec1] = std::from_chars(
+            std::data(start_str),
+            std::data(start_str) + std::size(start_str),
+            range_begin);
+        if (ec1 != std::errc{})
+        {
+            return false;
+        }
+
+        if (std::empty(end_str))
+        {
+            range_end = file_size - 1;
+        }
+        else
+        {
+            auto const [ptr2, ec2] = std::from_chars(std::data(end_str), std::data(end_str) + std::size(end_str), range_end);
+            if (ec2 != std::errc{})
+            {
+                return false;
+            }
+        }
+    }
+
+    if (range_begin > range_end || range_begin >= file_size)
+    {
+        return false;
+    }
+
+    // Clamp to file size
+    range_end = std::min(range_end, file_size - 1);
+    return true;
+}
+
+// Find which file in the torrent matches the given subpath.
+// Returns the file index or nullopt if not found.
+std::optional<tr_file_index_t> find_file_in_torrent(tr_torrent const& tor, std::string_view subpath)
+{
+    for (tr_file_index_t i = 0, n = tor.file_count(); i < n; ++i)
+    {
+        if (tor.file_subpath(i) == subpath)
+        {
+            return i;
+        }
+    }
+    return std::nullopt;
+}
+
+// Compute the absolute byte offset where a file starts within the torrent.
+uint64_t file_byte_offset(tr_torrent const& tor, tr_file_index_t file_index)
+{
+    uint64_t offset = 0;
+    for (tr_file_index_t i = 0; i < file_index; ++i)
+    {
+        offset += tor.file_size(i);
+    }
+    return offset;
+}
+
+// Set high priority on the file containing the requested range,
+// and mark it as wanted if it was previously unwanted.
+// The file-level priority system will cause the peer manager to
+// prioritize pieces belonging to this file.
+void prioritize_pieces_for_request(
+    tr_torrent* tor,
+    tr_file_index_t file_index,
+    [[maybe_unused]] uint64_t range_begin,
+    [[maybe_unused]] uint64_t range_end)
+{
+    // Mark file as wanted if it was not already
+    if (!tor->file_is_wanted(file_index))
+    {
+        tor->set_files_wanted(&file_index, 1, true);
+    }
+
+    // Set file to high priority to boost download of its pieces
+    tor->set_file_priorities(&file_index, 1, TR_PRI_HIGH);
+}
+
+// Check if all blocks in the given byte range are downloaded.
+bool is_range_available(tr_torrent const& tor, uint64_t abs_begin, uint64_t abs_end)
+{
+    auto const first_loc = tor.byte_loc(abs_begin);
+    auto const last_loc = tor.byte_loc(abs_end);
+
+    // Check block-by-block
+    for (auto block = first_loc.block; block <= last_loc.block; ++block)
+    {
+        if (!tor.has_block(block))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Context for a pending torrent content request that is waiting for pieces to download.
+struct torrent_content_request
+{
+    struct evhttp_request* req;
+    tr_rpc_server* server;
+    tr_torrent_id_t torrent_id;
+    tr_file_index_t file_index;
+    uint64_t file_size;
+    uint64_t range_begin;
+    uint64_t range_end;
+    bool is_range_request;
+    std::string mime_type;
+    std::unique_ptr<tr::Timer> poll_timer;
+    int poll_count = 0;
+};
+
+auto constexpr MaxPollCount = 600; // 60 seconds at 100ms intervals
+auto constexpr PollIntervalMs = std::chrono::milliseconds{ 100 };
+
+void send_torrent_content_response(torrent_content_request* ctx)
+{
+    auto* const tor = ctx->server->session->torrents().get(ctx->torrent_id);
+    if (tor == nullptr)
+    {
+        send_simple_response(ctx->req, HTTP_NOTFOUND, "Torrent no longer available");
+        delete ctx;
+        return;
+    }
+
+    auto const length = ctx->range_end - ctx->range_begin + 1;
+    auto const file_start = file_byte_offset(*tor, ctx->file_index);
+    auto const abs_begin = file_start + ctx->range_begin;
+
+    // Read the requested data
+    auto buf = std::vector<uint8_t>(length);
+    auto const loc = tor->byte_loc(abs_begin);
+    auto const err = tr_ioRead(*tor, loc, std::span<uint8_t>{ buf.data(), buf.size() });
+
+    if (err != 0)
+    {
+        send_simple_response(ctx->req, HTTP_INTERNAL, "Failed to read torrent data");
+        delete ctx;
+        return;
+    }
+
+    auto* const output_headers = evhttp_request_get_output_headers(ctx->req);
+    evhttp_add_header(output_headers, "Content-Type", ctx->mime_type.c_str());
+    evhttp_add_header(output_headers, "Accept-Ranges", "bytes");
+
+    auto const content_length = fmt::format("{}", length);
+    evhttp_add_header(output_headers, "Content-Length", content_length.c_str());
+
+    if (ctx->is_range_request)
+    {
+        auto const content_range = fmt::format("bytes {}-{}/{}", ctx->range_begin, ctx->range_end, ctx->file_size);
+        evhttp_add_header(output_headers, "Content-Range", content_range.c_str());
+
+        auto* const out = evbuffer_new();
+        evbuffer_add(out, buf.data(), buf.size());
+        evhttp_send_reply(ctx->req, 206, "Partial Content", out);
+        evbuffer_free(out);
+    }
+    else
+    {
+        auto* const out = evbuffer_new();
+        evbuffer_add(out, buf.data(), buf.size());
+        evhttp_send_reply(ctx->req, HTTP_OK, "OK", out);
+        evbuffer_free(out);
+    }
+
+    delete ctx;
+}
+
+void poll_for_pieces(torrent_content_request* ctx)
+{
+    auto* const tor = ctx->server->session->torrents().get(ctx->torrent_id);
+    if (tor == nullptr)
+    {
+        send_simple_response(ctx->req, HTTP_NOTFOUND, "Torrent no longer available");
+        delete ctx;
+        return;
+    }
+
+    auto const file_start = file_byte_offset(*tor, ctx->file_index);
+    auto const abs_begin = file_start + ctx->range_begin;
+    auto const abs_end = file_start + ctx->range_end;
+
+    if (is_range_available(*tor, abs_begin, abs_end))
+    {
+        send_torrent_content_response(ctx);
+        return;
+    }
+
+    ++ctx->poll_count;
+    if (ctx->poll_count >= MaxPollCount)
+    {
+        send_simple_response(ctx->req, HTTP_INTERNAL, "Timed out waiting for torrent data");
+        delete ctx;
+        return;
+    }
+
+    // Re-prioritize to keep pieces hot
+    prioritize_pieces_for_request(tor, ctx->file_index, ctx->range_begin, ctx->range_end);
+
+    // Schedule another poll
+    ctx->poll_timer->start_single_shot(PollIntervalMs);
+}
+
+void handle_torrent_content(struct evhttp_request* req, tr_rpc_server* server, std::string_view subpath)
+{
+    auto* const output_headers = evhttp_request_get_output_headers(req);
+
+    if (auto const cmd = evhttp_request_get_command(req); cmd != EVHTTP_REQ_GET)
+    {
+        evhttp_add_header(output_headers, "Allow", "GET");
+        send_simple_response(req, HTTP_BADMETHOD);
+        return;
+    }
+
+    // Reject directory traversal
+    if (tr_strv_contains(subpath, ".."sv))
+    {
+        send_simple_response(req, HTTP_NOTFOUND);
+        return;
+    }
+
+    // Remove query/fragment
+    subpath = subpath.substr(0, subpath.find_first_of("?#"sv));
+
+    // Parse: <infohash>/<filepath>
+    auto const slash = subpath.find('/');
+    if (slash == std::string_view::npos || slash == 0)
+    {
+        send_simple_response(req, HTTP_NOTFOUND, "Expected /transmission/torrents/&lt;infohash&gt;/&lt;filepath&gt;");
+        return;
+    }
+
+    auto const hash_str = subpath.substr(0, slash);
+    auto const file_path = subpath.substr(slash + 1);
+
+    if (std::empty(file_path))
+    {
+        send_simple_response(req, HTTP_NOTFOUND, "No file path specified");
+        return;
+    }
+
+    // Look up the torrent by info hash
+    auto const digest = tr_sha1_from_string(hash_str);
+    if (!digest.has_value())
+    {
+        send_simple_response(req, HTTP_NOTFOUND, "Invalid info hash");
+        return;
+    }
+
+    auto* const tor = server->session->torrents().get(digest.value());
+    if (tor == nullptr)
+    {
+        send_simple_response(req, HTTP_NOTFOUND, "Torrent not found");
+        return;
+    }
+
+    if (!tor->has_metainfo())
+    {
+        send_simple_response(req, HTTP_NOTFOUND, "Torrent metadata not yet available");
+        return;
+    }
+
+    // Find the file
+    auto const file_index = find_file_in_torrent(*tor, file_path);
+    if (!file_index.has_value())
+    {
+        send_simple_response(req, HTTP_NOTFOUND, "File not found in torrent");
+        return;
+    }
+
+    auto const fi = file_index.value();
+    auto const file_size = tor->file_size(fi);
+
+    if (file_size == 0)
+    {
+        evhttp_add_header(output_headers, "Content-Length", "0");
+        evhttp_add_header(output_headers, "Content-Type", mimetype_guess_extended(file_path));
+        evhttp_add_header(output_headers, "Accept-Ranges", "bytes");
+        evhttp_send_reply(req, HTTP_OK, "OK", nullptr);
+        return;
+    }
+
+    // Parse Range header
+    auto const* const input_headers = evhttp_request_get_input_headers(req);
+    auto const* const range_hdr = evhttp_find_header(input_headers, "Range");
+
+    auto range_begin = uint64_t{ 0 };
+    auto range_end = file_size - 1;
+    bool const is_range_request = parse_range_header(range_hdr, file_size, range_begin, range_end);
+
+    if (range_hdr != nullptr && !is_range_request)
+    {
+        // Range header present but invalid
+        auto const content_range = fmt::format("bytes */{}", file_size);
+        evhttp_add_header(output_headers, "Content-Range", content_range.c_str());
+        send_simple_response(req, 416); // Range Not Satisfiable
+        return;
+    }
+
+    // Prioritize the pieces we need
+    prioritize_pieces_for_request(tor, fi, range_begin, range_end);
+
+    auto const file_start_byte = file_byte_offset(*tor, fi);
+    auto const abs_begin = file_start_byte + range_begin;
+    auto const abs_end = file_start_byte + range_end;
+
+    auto mime = std::string{ mimetype_guess_extended(file_path) };
+
+    if (is_range_available(*tor, abs_begin, abs_end))
+    {
+        // Data is already available, respond immediately
+        auto ctx = std::make_unique<torrent_content_request>();
+        ctx->req = req;
+        ctx->server = server;
+        ctx->torrent_id = tor->id();
+        ctx->file_index = fi;
+        ctx->file_size = file_size;
+        ctx->range_begin = range_begin;
+        ctx->range_end = range_end;
+        ctx->is_range_request = is_range_request;
+        ctx->mime_type = std::move(mime);
+        send_torrent_content_response(ctx.release());
+    }
+    else
+    {
+        // Data not yet available, poll until it is
+        auto* ctx = new torrent_content_request();
+        ctx->req = req;
+        ctx->server = server;
+        ctx->torrent_id = tor->id();
+        ctx->file_index = fi;
+        ctx->file_size = file_size;
+        ctx->range_begin = range_begin;
+        ctx->range_end = range_end;
+        ctx->is_range_request = is_range_request;
+        ctx->mime_type = std::move(mime);
+        ctx->poll_timer = server->session->timerMaker().create([ctx]() { poll_for_pieces(ctx); });
+        ctx->poll_timer->start_single_shot(PollIntervalMs);
+    }
+}
+
 void handle_rpc_from_json(struct evhttp_request* req, tr_rpc_server* server, std::string_view json)
 {
     tr_rpc_request_exec(
@@ -584,10 +1018,11 @@ void handle_request(struct evhttp_request* req, void* arg)
 
     server->login_attempts_ = 0;
 
-    // eg '/transmission/web/' and '/transmission/rpc'
+    // eg '/transmission/web/' and '/transmission/rpc' and '/transmission/torrents/'
     auto const& base_path = server->url();
     auto const web_base_path = tr_urlbuf{ base_path, TrHttpServerWebRelativePath };
     auto const rpc_base_path = tr_urlbuf{ base_path, TrHttpServerRpcRelativePath };
+    auto const torrents_base_path = tr_urlbuf{ base_path, TrHttpServerTorrentsRelativePath };
     auto const deprecated_web_path = tr_urlbuf{ base_path, "web" /*no trailing slash*/ };
 
     char const* const uri = evhttp_request_get_uri(req);
@@ -600,6 +1035,23 @@ void handle_request(struct evhttp_request* req, void* arg)
     else if (tr_strv_starts_with(uri, web_base_path))
     {
         handle_web_client(req, server);
+    }
+    else if (tr_strv_starts_with(uri, torrents_base_path))
+    {
+        if (!server->settings_.is_torrent_serving_enabled)
+        {
+            send_simple_response(req, HTTP_NOTFOUND, "Torrent content serving is disabled");
+        }
+        else if (!isHostnameAllowed(server, req))
+        {
+            send_simple_response(req, 421, "Host not whitelisted");
+        }
+        else
+        {
+            auto subpath = std::string_view{ uri };
+            subpath = subpath.substr(std::size(torrents_base_path));
+            handle_torrent_content(req, server, subpath);
+        }
     }
     else if (!isHostnameAllowed(server, req))
     {

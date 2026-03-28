@@ -21,6 +21,7 @@ inline auto constexpr TrDefaultRpcPort = 9091U;
 inline auto constexpr TrDefaultRpcWhitelist = std::string_view{ "127.0.0.1,::1" };
 
 inline auto constexpr TrHttpServerRpcRelativePath = std::string_view{ "rpc" };
+inline auto constexpr TrHttpServerTorrentsRelativePath = std::string_view{ "torrents/" };
 inline auto constexpr TrHttpServerWebRelativePath = std::string_view{ "web/" };
 inline auto constexpr TrRpcSessionIdHeader = std::string_view{ "X-Transmission-Session-Id" };
 inline auto constexpr TrRpcVersionHeader = std::string_view{ "X-Transmission-Rpc-Version" };

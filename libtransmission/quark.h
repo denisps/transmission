@@ -521,6 +521,7 @@ enum // NOLINT(performance-enum-size)
     TR_KEY_rpc_password,
     TR_KEY_rpc_port,
     TR_KEY_rpc_socket_mode,
+    TR_KEY_rpc_torrent_serving_enabled,
     TR_KEY_rpc_url,
     TR_KEY_rpc_username,
     TR_KEY_rpc_version,
