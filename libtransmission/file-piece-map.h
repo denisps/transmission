@@ -12,6 +12,7 @@
 #include <algorithm> // for std::binary_search()
 #include <cstdint> // for uint64_t
 #include <cstddef> // for size_t
+#include <unordered_map>
 #include <vector>
 
 #include "libtransmission/bitfield.h"
@@ -83,7 +84,7 @@ private:
 class tr_file_priorities
 {
 public:
-    TR_CONSTEXPR_VEC explicit tr_file_priorities(tr_file_piece_map const* fpm) noexcept
+    explicit tr_file_priorities(tr_file_piece_map const* fpm) noexcept
         : fpm_{ fpm }
     {
     }
@@ -91,12 +92,16 @@ public:
     void set(tr_file_index_t file, tr_priority_t priority);
     void set(tr_file_index_t const* files, size_t n, tr_priority_t priority);
 
+    void set_piece_priority(tr_piece_index_t piece, tr_priority_t priority);
+    void clear_piece_priorities();
+
     [[nodiscard]] tr_priority_t file_priority(tr_file_index_t file) const;
     [[nodiscard]] tr_priority_t piece_priority(tr_piece_index_t piece) const;
 
 private:
     tr_file_piece_map const* fpm_;
     std::vector<tr_priority_t> priorities_;
+    std::unordered_map<tr_piece_index_t, tr_priority_t> piece_priorities_;
 };
 
 class tr_files_wanted

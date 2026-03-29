@@ -513,44 +513,63 @@ uint64_t file_byte_offset(tr_torrent const& tor, tr_file_index_t file_index)
     return offset;
 }
 
-// Set high priority on the file containing the requested range,
-// and mark it as wanted if it was previously unwanted.
-// The file-level priority system will cause the peer manager to
-// prioritize pieces belonging to this file.
-void prioritize_pieces_for_request(
-    tr_torrent* tor,
-    tr_file_index_t file_index,
-    [[maybe_unused]] uint64_t range_begin,
-    [[maybe_unused]] uint64_t range_end)
+// Set per-piece priorities for torrent content serving:
+// - Mark the file as wanted (low priority) if it was previously unwanted
+// - Set pieces in the requested range to HIGH priority
+// - Set pieces in the lookahead range (same length, immediately after) to NORMAL priority
+void prioritize_pieces_for_request(tr_torrent* tor, tr_file_index_t file_index, uint64_t range_begin, uint64_t range_end)
 {
-    // Mark file as wanted if it was not already
+    // Mark file as wanted if it was not already, with low priority
     if (!tor->file_is_wanted(file_index))
     {
         tor->set_files_wanted(&file_index, 1, true);
+        tor->set_file_priorities(&file_index, 1, TR_PRI_LOW);
     }
 
-    // Set file to high priority to boost download of its pieces
-    tor->set_file_priorities(&file_index, 1, TR_PRI_HIGH);
-}
+    auto const file_offset_in_torrent = file_byte_offset(*tor, file_index);
+    auto const piece_file_span = tor->piece_span_for_file(file_index);
 
-// Check if all blocks in the given byte range are downloaded.
-bool is_range_available(tr_torrent const& tor, uint64_t abs_begin, uint64_t abs_end)
-{
-    auto const first_loc = tor.byte_loc(abs_begin);
-    auto const last_loc = tor.byte_loc(abs_end);
+    // Absolute byte positions within the torrent
+    auto const abs_begin = file_offset_in_torrent + range_begin;
+    auto const abs_end = file_offset_in_torrent + range_end;
+    auto const range_length = range_end - range_begin + 1;
 
-    // Check block-by-block
-    for (auto block = first_loc.block; block <= last_loc.block; ++block)
+    // Find piece range covering the requested bytes
+    auto const first_piece = tor->byte_loc(abs_begin).piece;
+    auto const last_piece = tor->byte_loc(abs_end).piece;
+
+    // Set HIGH priority for pieces in the requested range
+    for (auto piece = first_piece; piece <= last_piece; ++piece)
     {
-        if (!tor.has_block(block))
+        if (piece >= piece_file_span.begin && piece < piece_file_span.end)
         {
-            return false;
+            tor->set_piece_priority(piece, TR_PRI_HIGH);
         }
     }
-    return true;
+
+    // Lookahead: set NORMAL priority for pieces in the next range of equivalent length
+    auto const lookahead_abs_begin = abs_end + 1;
+    auto const lookahead_abs_end = abs_end + range_length;
+
+    if (lookahead_abs_begin < tor->total_size())
+    {
+        auto const lookahead_first = tor->byte_loc(lookahead_abs_begin).piece;
+        auto const clamped_end = std::min(lookahead_abs_end, tor->total_size() - 1);
+        auto const lookahead_last = tor->byte_loc(clamped_end).piece;
+
+        for (auto piece = lookahead_first; piece <= lookahead_last; ++piece)
+        {
+            if (piece >= piece_file_span.begin && piece < piece_file_span.end)
+            {
+                tor->set_piece_priority(piece, TR_PRI_NORMAL);
+            }
+        }
+    }
 }
 
-// Context for a pending torrent content request that is waiting for pieces to download.
+// Context for a streaming torrent content response.
+// Data is sent in bounded chunks as blocks become available,
+// avoiding loading the entire range into memory.
 struct torrent_content_request
 {
     struct evhttp_request* req;
@@ -564,98 +583,172 @@ struct torrent_content_request
     std::string mime_type;
     std::unique_ptr<tr::Timer> poll_timer;
     int poll_count = 0;
+
+    // Streaming state
+    bool reply_started = false;
+    uint64_t bytes_sent = 0; // bytes of the requested range sent so far
 };
 
 auto constexpr MaxPollCount = 600; // 60 seconds at 100ms intervals
 auto constexpr PollIntervalMs = std::chrono::milliseconds{ 100 };
+auto constexpr StreamChunkSize = uint64_t{ 256U * 1024U }; // max bytes per read/send pass
 
-void send_torrent_content_response(torrent_content_request* ctx)
+void stream_torrent_content(torrent_content_request* ctx);
+
+// Called by libevent when a chunk has been fully flushed to the socket.
+// This provides natural backpressure: we only send the next chunk after
+// the previous one has been written, keeping at most one chunk buffered.
+void on_chunk_flushed(struct evhttp_connection* /*evcon*/, void* arg)
 {
-    auto* const tor = ctx->server->session->torrents().get(ctx->torrent_id);
-    if (tor == nullptr)
-    {
-        send_simple_response(ctx->req, HTTP_NOTFOUND, "Torrent no longer available");
-        delete ctx;
-        return;
-    }
+    auto* ctx = static_cast<torrent_content_request*>(arg);
+    stream_torrent_content(ctx);
+}
 
-    auto const length = ctx->range_end - ctx->range_begin + 1;
-    auto const file_start = file_byte_offset(*tor, ctx->file_index);
-    auto const abs_begin = file_start + ctx->range_begin;
-
-    // Read the requested data
-    auto buf = std::vector<uint8_t>(length);
-    auto const loc = tor->byte_loc(abs_begin);
-    auto const err = tr_ioRead(*tor, loc, std::span<uint8_t>{ buf.data(), buf.size() });
-
-    if (err != 0)
-    {
-        send_simple_response(ctx->req, HTTP_INTERNAL, "Failed to read torrent data");
-        delete ctx;
-        return;
-    }
-
+// Begin the HTTP response (headers + start of chunked reply).
+void start_torrent_reply(torrent_content_request* ctx)
+{
     auto* const output_headers = evhttp_request_get_output_headers(ctx->req);
     evhttp_add_header(output_headers, "Content-Type", ctx->mime_type.c_str());
     evhttp_add_header(output_headers, "Accept-Ranges", "bytes");
 
-    auto const content_length = fmt::format("{}", length);
-    evhttp_add_header(output_headers, "Content-Length", content_length.c_str());
+    auto const length = ctx->range_end - ctx->range_begin + 1;
+    evhttp_add_header(output_headers, "Content-Length", fmt::format("{}", length).c_str());
 
     if (ctx->is_range_request)
     {
         auto const content_range = fmt::format("bytes {}-{}/{}", ctx->range_begin, ctx->range_end, ctx->file_size);
         evhttp_add_header(output_headers, "Content-Range", content_range.c_str());
-
-        auto* const out = evbuffer_new();
-        evbuffer_add(out, buf.data(), buf.size());
-        evhttp_send_reply(ctx->req, 206, "Partial Content", out);
-        evbuffer_free(out);
+        evhttp_send_reply_start(ctx->req, 206, "Partial Content");
     }
     else
     {
-        auto* const out = evbuffer_new();
-        evbuffer_add(out, buf.data(), buf.size());
-        evhttp_send_reply(ctx->req, HTTP_OK, "OK", out);
-        evbuffer_free(out);
+        evhttp_send_reply_start(ctx->req, HTTP_OK, "OK");
     }
 
-    delete ctx;
+    ctx->reply_started = true;
 }
 
-void poll_for_pieces(torrent_content_request* ctx)
+// Stream one chunk of available blocks to the client, then wait for
+// the flush callback before sending the next. This ensures at most
+// one chunk (StreamChunkSize) is buffered in libevent at any time.
+// If blocked on unavailable data, schedules a poll timer instead.
+void stream_torrent_content(torrent_content_request* ctx)
 {
     auto* const tor = ctx->server->session->torrents().get(ctx->torrent_id);
     if (tor == nullptr)
     {
-        send_simple_response(ctx->req, HTTP_NOTFOUND, "Torrent no longer available");
+        if (ctx->reply_started)
+        {
+            evhttp_send_reply_end(ctx->req);
+        }
+        else
+        {
+            send_simple_response(ctx->req, HTTP_NOTFOUND, "Torrent no longer available");
+        }
         delete ctx;
         return;
     }
 
     auto const file_start = file_byte_offset(*tor, ctx->file_index);
-    auto const abs_begin = file_start + ctx->range_begin;
-    auto const abs_end = file_start + ctx->range_end;
+    auto const total_length = ctx->range_end - ctx->range_begin + 1;
 
-    if (is_range_available(*tor, abs_begin, abs_end))
+    // Send response headers on first entry
+    if (!ctx->reply_started)
     {
-        send_torrent_content_response(ctx);
-        return;
+        start_torrent_reply(ctx);
     }
 
-    ++ctx->poll_count;
-    if (ctx->poll_count >= MaxPollCount)
+    // All data sent?
+    if (ctx->bytes_sent >= total_length)
     {
-        send_simple_response(ctx->req, HTTP_INTERNAL, "Timed out waiting for torrent data");
+        evhttp_send_reply_end(ctx->req);
         delete ctx;
         return;
     }
 
-    // Re-prioritize to keep pieces hot
-    prioritize_pieces_for_request(tor, ctx->file_index, ctx->range_begin, ctx->range_end);
+    auto const current_abs = file_start + ctx->range_begin + ctx->bytes_sent;
+    auto const remaining = total_length - ctx->bytes_sent;
 
-    // Schedule another poll
-    ctx->poll_timer->start_single_shot(PollIntervalMs);
+    // Determine the block range for the next chunk (bounded by StreamChunkSize)
+    auto const chunk_want = std::min(StreamChunkSize, remaining);
+    auto const chunk_end_abs = current_abs + chunk_want - 1;
+
+    auto const first_block = tor->byte_loc(current_abs).block;
+    auto const last_block = tor->byte_loc(chunk_end_abs).block;
+
+    // The first block we need must be available to make progress
+    if (!tor->has_block(first_block))
+    {
+        // Data not yet downloaded — poll until it arrives
+        ++ctx->poll_count;
+        if (ctx->poll_count >= MaxPollCount)
+        {
+            evhttp_send_reply_end(ctx->req);
+            delete ctx;
+            return;
+        }
+
+        auto const next_byte_in_file = ctx->range_begin + ctx->bytes_sent;
+        prioritize_pieces_for_request(tor, ctx->file_index, next_byte_in_file, ctx->range_end);
+
+        ctx->poll_timer->start_single_shot(PollIntervalMs);
+        return;
+    }
+
+    // Find the longest run of consecutive available blocks (up to chunk size)
+    auto avail_end_block = first_block;
+    for (auto b = first_block + 1; b <= last_block; ++b)
+    {
+        if (!tor->has_block(b))
+        {
+            break;
+        }
+        avail_end_block = b;
+    }
+
+    // Compute readable byte count, clamped to the requested range
+    auto const avail_block_end_byte = static_cast<uint64_t>(tor->block_loc(avail_end_block).byte) +
+        tor->block_size(avail_end_block);
+    auto const readable_end_abs = std::min(avail_block_end_byte, file_start + ctx->range_end + 1);
+    auto const readable_bytes = std::min(readable_end_abs - current_abs, remaining);
+
+    // Read into a bounded buffer
+    auto buf = std::vector<uint8_t>(readable_bytes);
+    auto const loc = tor->byte_loc(current_abs);
+    auto const err = tr_ioRead(*tor, loc, std::span<uint8_t>{ buf.data(), buf.size() });
+
+    if (err != 0)
+    {
+        evhttp_send_reply_end(ctx->req);
+        delete ctx;
+        return;
+    }
+
+    ctx->bytes_sent += readable_bytes;
+    ctx->poll_count = 0; // reset timeout on progress
+
+    // Check if this is the final chunk
+    if (ctx->bytes_sent >= total_length)
+    {
+        // Last chunk: send without callback, then end the reply
+        auto* const evb = evbuffer_new();
+        evbuffer_add(evb, buf.data(), buf.size());
+        evhttp_send_reply_chunk(ctx->req, evb);
+        evbuffer_free(evb);
+
+        evhttp_send_reply_end(ctx->req);
+        delete ctx;
+        return;
+    }
+
+    // Send this chunk and wait for the flush callback before sending more.
+    // This is the backpressure mechanism: on_chunk_flushed() is called only
+    // after libevent has fully drained this chunk to the socket, so we never
+    // queue more than one chunk in the output buffer at a time.
+    auto* const evb = evbuffer_new();
+    evbuffer_add(evb, buf.data(), buf.size());
+    evhttp_send_reply_chunk_with_cb(ctx->req, evb, on_chunk_flushed, ctx);
+    evbuffer_free(evb);
 }
 
 void handle_torrent_content(struct evhttp_request* req, tr_rpc_server* server, std::string_view subpath)
@@ -757,43 +850,25 @@ void handle_torrent_content(struct evhttp_request* req, tr_rpc_server* server, s
     // Prioritize the pieces we need
     prioritize_pieces_for_request(tor, fi, range_begin, range_end);
 
-    auto const file_start_byte = file_byte_offset(*tor, fi);
-    auto const abs_begin = file_start_byte + range_begin;
-    auto const abs_end = file_start_byte + range_end;
-
     auto mime = std::string{ mimetype_guess_extended(file_path) };
 
-    if (is_range_available(*tor, abs_begin, abs_end))
-    {
-        // Data is already available, respond immediately
-        auto ctx = std::make_unique<torrent_content_request>();
-        ctx->req = req;
-        ctx->server = server;
-        ctx->torrent_id = tor->id();
-        ctx->file_index = fi;
-        ctx->file_size = file_size;
-        ctx->range_begin = range_begin;
-        ctx->range_end = range_end;
-        ctx->is_range_request = is_range_request;
-        ctx->mime_type = std::move(mime);
-        send_torrent_content_response(ctx.release());
-    }
-    else
-    {
-        // Data not yet available, poll until it is
-        auto* ctx = new torrent_content_request();
-        ctx->req = req;
-        ctx->server = server;
-        ctx->torrent_id = tor->id();
-        ctx->file_index = fi;
-        ctx->file_size = file_size;
-        ctx->range_begin = range_begin;
-        ctx->range_end = range_end;
-        ctx->is_range_request = is_range_request;
-        ctx->mime_type = std::move(mime);
-        ctx->poll_timer = server->session->timerMaker().create([ctx]() { poll_for_pieces(ctx); });
-        ctx->poll_timer->start_single_shot(PollIntervalMs);
-    }
+    // Create a streaming context — data is sent in bounded chunks
+    // as blocks become available, never loading the full range into memory.
+    auto* ctx = new torrent_content_request();
+    ctx->req = req;
+    ctx->server = server;
+    ctx->torrent_id = tor->id();
+    ctx->file_index = fi;
+    ctx->file_size = file_size;
+    ctx->range_begin = range_begin;
+    ctx->range_end = range_end;
+    ctx->is_range_request = is_range_request;
+    ctx->mime_type = std::move(mime);
+    ctx->poll_timer = server->session->timerMaker().create([ctx]() { stream_torrent_content(ctx); });
+
+    // Start streaming immediately — will send available blocks
+    // and poll for any that are not yet downloaded.
+    stream_torrent_content(ctx);
 }
 
 void handle_rpc_from_json(struct evhttp_request* req, tr_rpc_server* server, std::string_view json)

@@ -184,6 +184,12 @@ tr_priority_t tr_file_priorities::file_priority(tr_file_index_t const file) cons
 
 tr_priority_t tr_file_priorities::piece_priority(tr_piece_index_t const piece) const
 {
+    // Check per-piece overrides first (e.g. from torrent content serving)
+    if (auto const it = piece_priorities_.find(piece); it != piece_priorities_.end())
+    {
+        return it->second;
+    }
+
     // increase priority if a file begins or ends in this piece
     // because that makes life easier for code/users using at incomplete files.
     // Xrefs: f2daeb242, https://forum.transmissionbt.com/viewtopic.php?t=10473
@@ -204,6 +210,16 @@ tr_priority_t tr_file_priorities::piece_priority(tr_piece_index_t const piece) c
     }
 
     return TR_PRI_NORMAL;
+}
+
+void tr_file_priorities::set_piece_priority(tr_piece_index_t const piece, tr_priority_t const priority)
+{
+    piece_priorities_[piece] = priority;
+}
+
+void tr_file_priorities::clear_piece_priorities()
+{
+    piece_priorities_.clear();
 }
 
 // ---

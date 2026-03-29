@@ -441,6 +441,16 @@ struct tr_torrent
         }
     }
 
+    void set_piece_priority(tr_piece_index_t piece, tr_priority_t priority)
+    {
+        file_priorities_.set_piece_priority(piece, priority);
+    }
+
+    void clear_piece_priorities()
+    {
+        file_priorities_.clear_piece_priorities();
+    }
+
     /// LOCATION
 
     [[nodiscard]] constexpr tr_interned_string current_dir() const noexcept
