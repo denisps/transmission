@@ -1998,6 +1998,11 @@ bool tr_torrent::check_piece(tr_piece_index_t const piece) const
     return pass;
 }
 
+bool tr_torrent::read_bytes(tr_block_info::Location const& loc, std::span<uint8_t> buf) const
+{
+    return tr_ioRead(*this, loc, buf) == 0;
+}
+
 // ---
 
 bool tr_torrent::set_announce_list(std::string_view announce_list_str)

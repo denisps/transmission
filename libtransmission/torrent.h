@@ -347,6 +347,8 @@ struct tr_torrent
         return completion_.has_blocks(span);
     }
 
+    [[nodiscard]] bool read_bytes(tr_block_info::Location const& loc, std::span<uint8_t> buf) const;
+
     [[nodiscard]] auto count_missing_blocks_in_piece(tr_piece_index_t piece) const
     {
         return completion_.count_missing_blocks_in_piece(piece);

@@ -38,7 +38,6 @@
 #include "libtransmission/crypto-utils.h" /* tr_ssha1_matches() */
 #include "libtransmission/error.h"
 #include "libtransmission/file-utils.h"
-#include "libtransmission/inout.h"
 #include "libtransmission/log.h"
 #include "libtransmission/net.h"
 #include "libtransmission/platform.h" /* tr_getWebClientDir() */
@@ -691,9 +690,7 @@ void stream_torrent_content(torrent_content_request* ctx)
     // Read into a bounded buffer
     auto buf = std::vector<uint8_t>(readable_bytes);
     auto const loc = tor->byte_loc(current_abs);
-    auto const err = tr_ioRead(*tor, loc, std::span<uint8_t>{ buf.data(), buf.size() });
-
-    if (err != 0)
+    if (!tor->read_bytes(loc, std::span<uint8_t>{ buf.data(), buf.size() }))
     {
         evhttp_send_reply_end(ctx->req);
         delete ctx;
@@ -745,8 +742,8 @@ void handle_torrent_content(struct evhttp_request* req, tr_rpc_server* server, s
         return;
     }
 
-    // Remove query/fragment
-    subpath = subpath.substr(0, subpath.find_first_of("?#"sv));
+    // Remove query string (e.g. cache-busting params)
+    subpath = subpath.substr(0, subpath.find('?'));
 
     // Parse: <infohash>/<filepath>
     auto const slash = subpath.find('/');
