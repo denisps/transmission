@@ -204,15 +204,38 @@ void send_simple_response(struct evhttp_request* req, int code, char const* text
 
 [[nodiscard]] constexpr char const* mimetype_guess(std::string_view path)
 {
-    // these are the ones we need for serving the web client's files...
-    auto constexpr Types = std::array<std::pair<std::string_view, char const*>, 7>{ {
+    // MIME types for serving web client and torrent content files
+    auto constexpr Types = std::array<std::pair<std::string_view, char const*>, 30>{ {
+        { ".aac"sv, "audio/aac" },
+        { ".avi"sv, "video/x-msvideo" },
         { ".css"sv, "text/css" },
+        { ".flac"sv, "audio/flac" },
         { ".gif"sv, "image/gif" },
+        { ".htm"sv, "text/html" },
         { ".html"sv, "text/html" },
         { ".ico"sv, "image/vnd.microsoft.icon" },
+        { ".jpeg"sv, "image/jpeg" },
+        { ".jpg"sv, "image/jpeg" },
         { ".js"sv, "application/javascript" },
+        { ".json"sv, "application/json" },
+        { ".m4a"sv, "audio/mp4" },
+        { ".m4v"sv, "video/mp4" },
+        { ".mkv"sv, "video/x-matroska" },
+        { ".mov"sv, "video/quicktime" },
+        { ".mp3"sv, "audio/mpeg" },
+        { ".mp4"sv, "video/mp4" },
+        { ".mpeg"sv, "video/mpeg" },
+        { ".ogg"sv, "audio/ogg" },
+        { ".ogv"sv, "video/ogg" },
+        { ".opus"sv, "audio/opus" },
         { ".png"sv, "image/png" },
         { ".svg"sv, "image/svg+xml" },
+        { ".ts"sv, "video/mp2t" },
+        { ".txt"sv, "text/plain" },
+        { ".wav"sv, "audio/wav" },
+        { ".weba"sv, "audio/webm" },
+        { ".webm"sv, "video/webm" },
+        { ".webp"sv, "image/webp" },
     } };
 
     for (auto const& [suffix, mime_type] : Types)
@@ -368,56 +391,9 @@ void handle_web_client(struct evhttp_request* req, tr_rpc_server const* server)
 
 // ---
 
-[[nodiscard]] constexpr char const* mimetype_guess_extended(std::string_view path)
-{
-    // Extended MIME types for serving torrent content (media, web pages, etc.)
-    auto constexpr Types = std::array<std::pair<std::string_view, char const*>, 30>{ {
-        { ".aac"sv, "audio/aac" },
-        { ".avi"sv, "video/x-msvideo" },
-        { ".css"sv, "text/css" },
-        { ".flac"sv, "audio/flac" },
-        { ".gif"sv, "image/gif" },
-        { ".htm"sv, "text/html" },
-        { ".html"sv, "text/html" },
-        { ".ico"sv, "image/vnd.microsoft.icon" },
-        { ".jpeg"sv, "image/jpeg" },
-        { ".jpg"sv, "image/jpeg" },
-        { ".js"sv, "application/javascript" },
-        { ".json"sv, "application/json" },
-        { ".m4a"sv, "audio/mp4" },
-        { ".m4v"sv, "video/mp4" },
-        { ".mkv"sv, "video/x-matroska" },
-        { ".mov"sv, "video/quicktime" },
-        { ".mp3"sv, "audio/mpeg" },
-        { ".mp4"sv, "video/mp4" },
-        { ".mpeg"sv, "video/mpeg" },
-        { ".ogg"sv, "audio/ogg" },
-        { ".ogv"sv, "video/ogg" },
-        { ".opus"sv, "audio/opus" },
-        { ".png"sv, "image/png" },
-        { ".svg"sv, "image/svg+xml" },
-        { ".ts"sv, "video/mp2t" },
-        { ".txt"sv, "text/plain" },
-        { ".wav"sv, "audio/wav" },
-        { ".weba"sv, "audio/webm" },
-        { ".webm"sv, "video/webm" },
-        { ".webp"sv, "image/webp" },
-    } };
-
-    for (auto const& [suffix, mime_type] : Types)
-    {
-        if (tr_strv_ends_with(path, suffix))
-        {
-            return mime_type;
-        }
-    }
-
-    return "application/octet-stream";
-}
-
 // Parse an HTTP Range header value like "bytes=START-END" into byte offsets.
 // Returns true on success, populating range_begin and range_end (inclusive).
-bool parse_range_header(char const* range_str, uint64_t file_size, uint64_t& range_begin, uint64_t& range_end)
+[[nodiscard]] bool parse_range_header(char const* range_str, uint64_t file_size, uint64_t& range_begin, uint64_t& range_end)
 {
     if (range_str == nullptr)
     {
@@ -488,9 +464,20 @@ bool parse_range_header(char const* range_str, uint64_t file_size, uint64_t& ran
     return true;
 }
 
+// Compute the absolute byte offset where a file starts within the torrent.
+[[nodiscard]] uint64_t file_byte_offset(tr_torrent const& tor, tr_file_index_t file_index)
+{
+    uint64_t offset = 0;
+    for (tr_file_index_t i = 0; i < file_index; ++i)
+    {
+        offset += tor.file_size(i);
+    }
+    return offset;
+}
+
 // Find which file in the torrent matches the given subpath.
 // Returns the file index or nullopt if not found.
-std::optional<tr_file_index_t> find_file_in_torrent(tr_torrent const& tor, std::string_view subpath)
+[[nodiscard]] std::optional<tr_file_index_t> find_file_in_torrent(tr_torrent const& tor, std::string_view subpath)
 {
     for (tr_file_index_t i = 0, n = tor.file_count(); i < n; ++i)
     {
@@ -500,17 +487,6 @@ std::optional<tr_file_index_t> find_file_in_torrent(tr_torrent const& tor, std::
         }
     }
     return std::nullopt;
-}
-
-// Compute the absolute byte offset where a file starts within the torrent.
-uint64_t file_byte_offset(tr_torrent const& tor, tr_file_index_t file_index)
-{
-    uint64_t offset = 0;
-    for (tr_file_index_t i = 0; i < file_index; ++i)
-    {
-        offset += tor.file_size(i);
-    }
-    return offset;
 }
 
 // Set per-piece priorities for torrent content serving:
@@ -580,8 +556,8 @@ struct torrent_content_request
     uint64_t range_begin;
     uint64_t range_end;
     bool is_range_request;
-    std::string mime_type;
-    std::unique_ptr<tr::Timer> poll_timer;
+    char const* mime_type = nullptr;
+    std::unique_ptr<tr::Timer> poll_timer = {};
     int poll_count = 0;
 
     // Streaming state
@@ -608,7 +584,7 @@ void on_chunk_flushed(struct evhttp_connection* /*evcon*/, void* arg)
 void start_torrent_reply(torrent_content_request* ctx)
 {
     auto* const output_headers = evhttp_request_get_output_headers(ctx->req);
-    evhttp_add_header(output_headers, "Content-Type", ctx->mime_type.c_str());
+    evhttp_add_header(output_headers, "Content-Type", ctx->mime_type);
     evhttp_add_header(output_headers, "Accept-Ranges", "bytes");
 
     auto const length = ctx->range_end - ctx->range_begin + 1;
@@ -824,7 +800,7 @@ void handle_torrent_content(struct evhttp_request* req, tr_rpc_server* server, s
     if (file_size == 0)
     {
         evhttp_add_header(output_headers, "Content-Length", "0");
-        evhttp_add_header(output_headers, "Content-Type", mimetype_guess_extended(file_path));
+        evhttp_add_header(output_headers, "Content-Type", mimetype_guess(file_path));
         evhttp_add_header(output_headers, "Accept-Ranges", "bytes");
         evhttp_send_reply(req, HTTP_OK, "OK", nullptr);
         return;
@@ -850,20 +826,22 @@ void handle_torrent_content(struct evhttp_request* req, tr_rpc_server* server, s
     // Prioritize the pieces we need
     prioritize_pieces_for_request(tor, fi, range_begin, range_end);
 
-    auto mime = std::string{ mimetype_guess_extended(file_path) };
+    auto const* const mime = mimetype_guess(file_path);
 
     // Create a streaming context — data is sent in bounded chunks
     // as blocks become available, never loading the full range into memory.
-    auto* ctx = new torrent_content_request();
-    ctx->req = req;
-    ctx->server = server;
-    ctx->torrent_id = tor->id();
-    ctx->file_index = fi;
-    ctx->file_size = file_size;
-    ctx->range_begin = range_begin;
-    ctx->range_end = range_end;
-    ctx->is_range_request = is_range_request;
-    ctx->mime_type = std::move(mime);
+    // poll_timer is set separately since its lambda captures ctx.
+    auto* ctx = new torrent_content_request{
+        .req = req,
+        .server = server,
+        .torrent_id = tor->id(),
+        .file_index = fi,
+        .file_size = file_size,
+        .range_begin = range_begin,
+        .range_end = range_end,
+        .is_range_request = is_range_request,
+        .mime_type = mime,
+    };
     ctx->poll_timer = server->session->timerMaker().create([ctx]() { stream_torrent_content(ctx); });
 
     // Start streaming immediately — will send available blocks
