@@ -19,9 +19,12 @@
 
 #include <giomm/file.h>
 #include <glibmm/i18n.h>
+#include <glibmm/main.h>
 #include <gtkmm/checkbutton.h>
 #include <gtkmm/combobox.h>
 #include <gtkmm/filefilter.h>
+
+#include <fmt/core.h>
 
 #include <memory>
 #include <utility>
@@ -63,6 +66,9 @@ private:
 
     void removeOldTorrent();
     void updateTorrent();
+    void startMetadataPrefetch();
+    void onMetadataCompleted(tr_torrent_id_t tor_id);
+    void stopMetadataTimer();
 
     void addResponseCB(int response);
 
@@ -80,11 +86,25 @@ private:
     Gtk::CheckButton* trash_check_ = nullptr;
     Gtk::ComboBox* priority_combo_ = nullptr;
     FreeSpaceLabel* freespace_label_ = nullptr;
+    Gtk::CheckButton* prefetch_check_ = nullptr;
+    sigc::connection metadata_timer_;
+    bool metadata_prefetch_active_ = false;
 };
 
 OptionsDialog::Impl::~Impl()
 {
+    stopMetadataTimer();
     removeOldTorrent();
+}
+
+void OptionsDialog::Impl::stopMetadataTimer()
+{
+    if (metadata_timer_.connected())
+    {
+        metadata_timer_.disconnect();
+    }
+
+    metadata_prefetch_active_ = false;
 }
 
 void OptionsDialog::Impl::removeOldTorrent()
@@ -97,13 +117,88 @@ void OptionsDialog::Impl::removeOldTorrent()
     }
 }
 
+void OptionsDialog::Impl::startMetadataPrefetch()
+{
+    if (tor_ == nullptr || tr_torrentHasMetadata(tor_) || metadata_prefetch_active_)
+    {
+        return;
+    }
+
+    if (prefetch_check_ == nullptr || !prefetch_check_->get_active())
+    {
+        return;
+    }
+
+    metadata_prefetch_active_ = true;
+
+    if (prefetch_check_ != nullptr)
+    {
+        prefetch_check_->set_inconsistent(true);
+        prefetch_check_->set_label(_("Pre_fetch metadata (downloading...)"));
+    }
+
+    // Start the torrent so it can connect to peers and fetch metadata
+    tr_torrentStart(tor_);
+
+    // Poll for metadata completion
+    metadata_timer_ = Glib::signal_timeout().connect(
+        [this]()
+        {
+            if (tor_ == nullptr)
+            {
+                metadata_prefetch_active_ = false;
+                return false;
+            }
+
+            if (tr_torrentHasMetadata(tor_))
+            {
+                metadata_prefetch_active_ = false;
+
+                // Pause the torrent again - user will start it if desired
+                tr_torrentStop(tor_);
+
+                if (prefetch_check_ != nullptr)
+                {
+                    prefetch_check_->set_inconsistent(false);
+                    prefetch_check_->set_label(_("Pre_fetch metadata"));
+                }
+
+                // Refresh the file list
+                updateTorrent();
+                return false; // stop timer
+            }
+
+            // Update progress
+            if (prefetch_check_ != nullptr)
+            {
+                auto const pct = tr_torrentStat(tor_).metadata_percent_complete;
+                auto const text = fmt::format(fmt::runtime(_("Pre_fetch metadata ({pct:.0f}%)")), fmt::arg("pct", pct * 100.0));
+                prefetch_check_->set_label(text);
+            }
+
+            return true; // continue polling
+        },
+        500); // poll every 500ms
+}
+
+void OptionsDialog::Impl::onMetadataCompleted(tr_torrent_id_t /*tor_id*/)
+{
+    // This will be handled by the polling timer above
+}
+
 void OptionsDialog::Impl::addResponseCB(int response)
 {
+    stopMetadataTimer();
+
     if (tor_ != nullptr)
     {
         if (response == TR_GTK_RESPONSE_TYPE(ACCEPT))
         {
             tr_torrentSetPriority(tor_, static_cast<tr_priority_t>(gtr_combo_box_get_active_enum(*priority_combo_)));
+
+            // If metadata prefetch started the torrent, stop it first
+            // so the user's start preference is respected
+            tr_torrentStop(tor_);
 
             if (run_check_->get_active())
             {
@@ -138,9 +233,24 @@ void OptionsDialog::Impl::updateTorrent()
     else
     {
         tr_torrentSetDownloadDir(tor_, downloadDir_);
-        file_list_->set_sensitive(tr_torrentHasMetadata(tor_));
+        bool const has_metadata = tr_torrentHasMetadata(tor_);
+        file_list_->set_sensitive(has_metadata);
         file_list_->set_torrent(tr_torrentId(tor_));
-        tr_torrentVerify(tor_);
+
+        if (has_metadata)
+        {
+            tr_torrentVerify(tor_);
+
+            if (prefetch_check_ != nullptr)
+            {
+                prefetch_check_->set_inconsistent(false);
+                prefetch_check_->set_label(_("Pre_fetch metadata"));
+            }
+        }
+        else
+        {
+            startMetadataPrefetch();
+        }
     }
 }
 
@@ -303,6 +413,34 @@ OptionsDialog::Impl::Impl(
     else
     {
         sourceChanged(source_chooser);
+    }
+
+    prefetch_check_ = gtr_get_widget<Gtk::CheckButton>(builder, "prefetch_metadata");
+    bool const prefetch_enabled = gtr_pref_flag_get(TR_KEY_prefetch_magnet_metadata);
+    prefetch_check_->set_active(prefetch_enabled);
+    prefetch_check_->signal_toggled().connect(
+        [this]()
+        {
+            bool const active = prefetch_check_->get_active();
+            core_->set_pref(TR_KEY_prefetch_magnet_metadata, active);
+            if (active && tor_ != nullptr && !tr_torrentHasMetadata(tor_))
+            {
+                startMetadataPrefetch();
+            }
+            else if (!active)
+            {
+                stopMetadataTimer();
+                if (prefetch_check_ != nullptr)
+                {
+                    prefetch_check_->set_inconsistent(false);
+                    prefetch_check_->set_label(_("Pre_fetch metadata"));
+                }
+            }
+        });
+
+    if (prefetch_enabled && tor_ != nullptr && !tr_torrentHasMetadata(tor_))
+    {
+        startMetadataPrefetch();
     }
 
     dialog_.get_widget_for_response(TR_GTK_RESPONSE_TYPE(ACCEPT))->grab_focus();

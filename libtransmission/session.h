@@ -454,6 +454,7 @@ public:
         bool should_delete_source_torrents = false;
         bool should_scrape_paused_torrents = true;
         bool should_start_added_torrents = true;
+        bool prefetch_magnet_metadata = false;
         bool speed_limit_down_enabled = false;
         bool speed_limit_up_enabled = false;
         bool tcp_enabled = true;
@@ -540,6 +541,7 @@ public:
             Field<&Settings::port_forwarding_enabled>{ TR_KEY_port_forwarding_enabled },
             Field<&Settings::preallocation_mode>{ TR_KEY_preallocation },
             Field<&Settings::preferred_transports>{ TR_KEY_preferred_transports },
+            Field<&Settings::prefetch_magnet_metadata>{ TR_KEY_prefetch_magnet_metadata },
             Field<&Settings::proxy_url>{ TR_KEY_proxy_url },
             Field<&Settings::queue_stalled_enabled>{ TR_KEY_queue_stalled_enabled },
             Field<&Settings::queue_stalled_minutes>{ TR_KEY_queue_stalled_minutes },
@@ -1004,6 +1006,11 @@ public:
         return !settings_.should_start_added_torrents;
     }
 
+    [[nodiscard]] constexpr auto prefetchesMagnetMetadata() const noexcept
+    {
+        return settings_.prefetch_magnet_metadata;
+    }
+
     [[nodiscard]] constexpr auto shouldFullyVerifyAddedTorrents() const noexcept
     {
         return settings().torrent_added_verify_mode == TR_VERIFY_ADDED_FULL;
@@ -1305,6 +1312,7 @@ private:
     friend void tr_sessionSetCompleteVerifyEnabled(tr_session* session, bool enabled);
     friend void tr_sessionSetDHTEnabled(tr_session* session, bool enabled);
     friend void tr_sessionSetDeleteSource(tr_session* session, bool delete_source);
+    friend void tr_sessionSetPrefetchMagnetMetadata(tr_session* session, bool enabled);
     friend void tr_sessionSetEncryption(tr_session* session, tr_encryption_mode mode);
     friend void tr_sessionSetIdleLimit(tr_session* session, uint16_t idle_minutes);
     friend void tr_sessionSetIdleLimited(tr_session* session, bool is_limited);

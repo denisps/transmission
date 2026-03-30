@@ -28,6 +28,7 @@ public:
     {
         /* client prefs */
         OPTIONS_PROMPT,
+        PREFETCH_MAGNET_METADATA,
         OPEN_DIALOG_FOLDER,
         INHIBIT_HIBERNATION,
         DIR_WATCH,
@@ -187,6 +188,7 @@ private:
     static auto constexpr Items = std::array<PrefItem, PREFS_COUNT>{ {
         // gui settings
         { .id = OPTIONS_PROMPT, .key = TR_KEY_show_options_window, .type = QMetaType::Bool },
+        { .id = PREFETCH_MAGNET_METADATA, .key = TR_KEY_prefetch_magnet_metadata, .type = QMetaType::Bool },
         { .id = OPEN_DIALOG_FOLDER, .key = TR_KEY_open_dialog_dir, .type = QMetaType::QString },
         { .id = INHIBIT_HIBERNATION, .key = TR_KEY_inhibit_desktop_hibernation, .type = QMetaType::Bool },
         { .id = DIR_WATCH, .key = TR_KEY_watch_dir, .type = QMetaType::QString },

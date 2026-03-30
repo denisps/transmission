@@ -429,6 +429,7 @@ enum // NOLINT(performance-enum-size)
     TR_KEY_port_test,
     TR_KEY_preallocation,
     TR_KEY_preferred_transports,
+    TR_KEY_prefetch_magnet_metadata,
     TR_KEY_primary_mime_type_kebab_APICOMPAT,
     TR_KEY_primary_mime_type,
     TR_KEY_priorities,

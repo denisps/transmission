@@ -500,6 +500,10 @@ void Session::Impl::on_pref_changed(tr_quark const key)
         tr_sessionSetPeerLimitPerTorrent(session_, gtr_pref_int_get(key));
         break;
 
+    case TR_KEY_prefetch_magnet_metadata:
+        tr_sessionSetPrefetchMagnetMetadata(session_, gtr_pref_flag_get(key));
+        break;
+
     case TR_KEY_inhibit_desktop_hibernation:
         maybe_inhibit_hibernation();
         break;

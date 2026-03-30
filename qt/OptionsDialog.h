@@ -36,7 +36,7 @@ class OptionsDialog : public BaseDialog
     Q_OBJECT
 
 public:
-    OptionsDialog(Session& session, Prefs const& prefs, AddData addme, QWidget* parent = nullptr);
+    OptionsDialog(Session& session, Prefs& prefs, AddData addme, QWidget* parent = nullptr);
     OptionsDialog& operator=(OptionsDialog&&) = delete;
     OptionsDialog& operator=(OptionsDialog const&) = delete;
     OptionsDialog(OptionsDialog&&) = delete;
@@ -57,6 +57,7 @@ private:
     void reload();
     void updateWidgetsLocality();
     void clearInfo();
+    void startMetadataPrefetch();
 
     AddData add_;
     FileList files_;
@@ -66,7 +67,10 @@ private:
     std::vector<bool> wanted_;
     std::vector<int> priorities_;
     Session& session_;
+    Prefs& prefs_;
     Ui::OptionsDialog ui_ = {};
     std::optional<tr_torrent_metainfo> metainfo_;
     bool is_local_ = {};
+    QTimer metadata_timer_;
+    bool metadata_prefetch_active_ = false;
 };

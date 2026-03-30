@@ -32,10 +32,11 @@ using ::trqt::variant_helpers::listAdd;
 ****
 ***/
 
-OptionsDialog::OptionsDialog(Session& session, Prefs const& prefs, AddData addme, QWidget* parent)
+OptionsDialog::OptionsDialog(Session& session, Prefs& prefs, AddData addme, QWidget* parent)
     : BaseDialog{ parent }
     , add_{ std::move(addme) }
     , session_{ session }
+    , prefs_{ prefs }
     , is_local_{ session_.isLocal() }
 {
     ui_.setupUi(this);
@@ -96,6 +97,11 @@ OptionsDialog::OptionsDialog(Session& session, Prefs const& prefs, AddData addme
 
     ui_.startCheck->setChecked(prefs.get<bool>(Prefs::START));
     ui_.trashCheck->setChecked(prefs.get<bool>(Prefs::TRASH_ORIGINAL));
+    ui_.prefetchMetadataCheck->setChecked(prefs.get<bool>(Prefs::PREFETCH_MAGNET_METADATA));
+    connect(
+        ui_.prefetchMetadataCheck,
+        &QAbstractButton::toggled,
+        [this](bool const val) { prefs_.set(Prefs::PREFETCH_MAGNET_METADATA, val); });
 
     connect(ui_.dialogButtons, &QDialogButtonBox::rejected, this, &QObject::deleteLater);
     connect(ui_.dialogButtons, &QDialogButtonBox::accepted, this, &OptionsDialog::onAccepted);
@@ -104,6 +110,27 @@ OptionsDialog::OptionsDialog(Session& session, Prefs const& prefs, AddData addme
     connect(ui_.filesView, &FileTreeView::wantedChanged, this, &OptionsDialog::onWantedChanged);
 
     connect(&session_, &Session::sessionUpdated, this, &OptionsDialog::onSessionUpdated);
+
+    metadata_timer_.setInterval(500);
+    connect(
+        &metadata_timer_,
+        &QTimer::timeout,
+        this,
+        [this]()
+        {
+            if (!metainfo_ || !metadata_prefetch_active_)
+            {
+                metadata_timer_.stop();
+                return;
+            }
+
+            // For Qt client, metadata is parsed locally - we can't poll the daemon.
+            // The Qt client uses RPC to add torrents, so metadata prefetch mainly
+            // applies to the GTK client which has direct session access.
+            // For Qt, we just show the status label if no files are available.
+            metadata_timer_.stop();
+            metadata_prefetch_active_ = false;
+        });
 
     updateWidgetsLocality();
     reload();
@@ -186,6 +213,11 @@ void OptionsDialog::reload()
 
     ui_.filesView->update(files_);
     ui_.filesView->hideColumn(FileTreeModel::COL_PROGRESS);
+
+    if (add_.type == AddData::MAGNET && metainfo_ && metainfo_->file_count() == 0)
+    {
+        startMetadataPrefetch();
+    }
 }
 
 void OptionsDialog::updateWidgetsLocality()
@@ -193,6 +225,24 @@ void OptionsDialog::updateWidgetsLocality()
     ui_.destinationStack->setCurrentWidget(is_local_ ? static_cast<QWidget*>(ui_.destinationButton) : ui_.destinationEdit);
     ui_.destinationStack->setFixedHeight(ui_.destinationStack->currentWidget()->sizeHint().height());
     ui_.destinationLabel->setBuddy(ui_.destinationStack->currentWidget());
+}
+
+void OptionsDialog::startMetadataPrefetch()
+{
+    if (!metainfo_ || metainfo_->file_count() > 0 || metadata_prefetch_active_)
+    {
+        return;
+    }
+
+    if (!ui_.prefetchMetadataCheck->isChecked())
+    {
+        return;
+    }
+
+    // For magnet links with no file info yet
+    metadata_prefetch_active_ = true;
+    ui_.filesView->setVisible(false);
+    layout()->setSizeConstraint(QLayout::SetFixedSize);
 }
 
 void OptionsDialog::onSessionUpdated()

@@ -418,6 +418,7 @@ auto constexpr MyStatic = std::array<std::u8string_view, TR_N_KEYS>{
     u8"port_test"sv, // rpc
     u8"preallocation"sv, // tr_session::Settings
     u8"preferred_transports"sv, // rpc, tr_session::Settings
+    u8"prefetch_magnet_metadata"sv, // gtk app, qt app
     u8"primary-mime-type"sv, // rpc
     u8"primary_mime_type"sv, // rpc
     u8"priorities"sv, // rpc

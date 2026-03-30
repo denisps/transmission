@@ -273,6 +273,7 @@ tr_variant::Map Prefs::defaults()
     map.try_emplace(TR_KEY_show_filterbar, true);
     map.try_emplace(TR_KEY_show_notification_area_icon, false);
     map.try_emplace(TR_KEY_show_options_window, true);
+    map.try_emplace(TR_KEY_prefetch_magnet_metadata, false);
     map.try_emplace(TR_KEY_show_statusbar, true);
     map.try_emplace(TR_KEY_show_toolbar, true);
     map.try_emplace(TR_KEY_show_tracker_scrapes, false);

@@ -397,6 +397,9 @@ void tr_sessionSetPaused(tr_session* session, bool is_paused);
 
 void tr_sessionSetDeleteSource(tr_session* session, bool delete_source);
 
+bool tr_sessionGetPrefetchMagnetMetadata(tr_session const* session);
+void tr_sessionSetPrefetchMagnetMetadata(tr_session* session, bool enabled);
+
 tr_priority_t tr_torrentGetPriority(tr_torrent const* tor);
 void tr_torrentSetPriority(tr_torrent* tor, tr_priority_t priority);
 
